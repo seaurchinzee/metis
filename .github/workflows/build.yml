@@ -1,0 +1,99 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create (e.g. v2.4-20260305)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MLton
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mlton libgmp-dev
+      - name: Build (static)
+        run: make mlton MLTON='mlton -link-opt -static'
+      - name: Verify
+        run: |
+          if ldd bin/mlton/metis; then
+            echo "expected a static binary" >&2
+            exit 1
+          fi
+          bin/mlton/metis --version
+      - name: Package
+        run: |
+          mkdir -p dist/metis
+          cp bin/mlton/metis LICENSE dist/metis/
+          tar -C dist -czf metis-linux-x64.tar.gz metis
+          shasum -a 256 metis-linux-x64.tar.gz > metis-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metis-linux-x64
+          path: |
+            metis-linux-x64.tar.gz
+            metis-linux-x64.tar.gz.sha256
+
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MLton
+        run: brew install mlton
+      - name: Build
+        run: make mlton
+      - name: Bundle libgmp
+        run: |
+          cd bin/mlton
+          GMP=$(otool -L metis | awk '/libgmp/ { print $1 }')
+          test -n "$GMP"
+          cp "$GMP" libgmp.10.dylib
+          chmod u+w libgmp.10.dylib
+          install_name_tool -change "$GMP" '@loader_path/libgmp.10.dylib' metis
+          codesign --force -s - libgmp.10.dylib metis
+      - name: Verify
+        run: |
+          mkdir "$RUNNER_TEMP/iso"
+          cp bin/mlton/metis bin/mlton/libgmp.10.dylib "$RUNNER_TEMP/iso/"
+          "$RUNNER_TEMP/iso/metis" --version
+          otool -L "$RUNNER_TEMP/iso/metis" | grep '@loader_path/libgmp.10.dylib'
+      - name: Package
+        run: |
+          mkdir -p dist/metis
+          cp bin/mlton/metis bin/mlton/libgmp.10.dylib LICENSE dist/metis/
+          tar -C dist -czf metis-macos-arm64.tar.gz metis
+          shasum -a 256 metis-macos-arm64.tar.gz > metis-macos-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metis-macos-arm64
+          path: |
+            metis-macos-arm64.tar.gz
+            metis-macos-arm64.tar.gz.sha256
+
+  release:
+    needs: [linux-x64, macos-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          shasum -a 256 -c ./*.sha256
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Prebuilt metis binaries (MIT, LICENSE included in each archive). Verify with the per-asset .sha256 files." \
+            metis-linux-x64.tar.gz metis-linux-x64.tar.gz.sha256 \
+            metis-macos-arm64.tar.gz metis-macos-arm64.tar.gz.sha256
